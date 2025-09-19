@@ -57,7 +57,7 @@ Follow these steps to set up and run the project on your local machine.
 4.  **Add your API Key:**
     Open the `main.py` file and find this line (around line 21):
     ```python
-    api_key = "AIzaSyARiMM-cfeVHABE0q47hb14RBh0Z7mImV4"  # Replace with a valid key
+    api_key = "write your own gemini api key"  # Replace with a valid key
     ```
     Replace the placeholder key with your own Google Gemini API key.
 

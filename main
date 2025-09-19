@@ -1,0 +1,1056 @@
+import customtkinter
+import google.generativeai as genai
+import os
+import json
+import datetime
+from tkinter import messagebox, filedialog, simpledialog
+import threading
+import sqlite3
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
+from PIL import Image, ImageTk
+import requests
+from io import BytesIO
+import csv
+import pickle
+
+# --- AI Configuration ---
+try:
+    api_key = "Paste your own API key"  
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-2.5-flash')
+except (KeyError, ValueError) as e:
+    messagebox.showerror("API Configuration Error",
+                         f"Failed to configure Generative AI. Please check your API key. Error: {e}")
+    exit()
+
+class DatabaseManager:
+    def __init__(self, db_path="calorie_tracker.db"):
+        self.db_path = db_path
+        self.init_database()
+
+    def init_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS meals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                food_description TEXT NOT NULL,
+                calories REAL NOT NULL,
+                protein REAL NOT NULL,
+                fat REAL NOT NULL,
+                carbs REAL NOT NULL,
+                fiber REAL DEFAULT 0,
+                sugar REAL DEFAULT 0,
+                sodium REAL DEFAULT 0,
+                meal_type TEXT DEFAULT 'snack'
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_goals (
+                date TEXT PRIMARY KEY,
+                calories REAL NOT NULL,
+                protein REAL NOT NULL,
+                fat REAL NOT NULL,
+                carbs REAL NOT NULL,
+                water_ml REAL DEFAULT 2000,
+                exercise_minutes REAL DEFAULT 30
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS exercises (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                exercise_name TEXT NOT NULL,
+                duration_minutes REAL NOT NULL,
+                calories_burned REAL NOT NULL,
+                intensity TEXT DEFAULT 'moderate'
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS water_intake (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                amount_ml REAL NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS favorite_foods (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                calories_per_serving REAL NOT NULL,
+                protein_per_serving REAL NOT NULL,
+                fat_per_serving REAL NOT NULL,
+                carbs_per_serving REAL NOT NULL,
+                serving_size TEXT NOT NULL,
+                added_date TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def save_meal(self, date, timestamp, food_description, nutrition_data, meal_type='snack'):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        foods = nutrition_data.get('foods', [])
+        if not isinstance(foods, list):
+            foods = [foods]
+        for food in foods:
+            if not isinstance(food, dict): continue
+            cursor.execute('''
+                INSERT INTO meals (date, timestamp, food_description, calories, protein, fat, carbs, fiber, sugar, sodium, meal_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                date, timestamp, food.get('name', food_description),
+                food.get('calories', 0), food.get('protein_g', 0), food.get('fat_g', 0), food.get('carbs_g', 0),
+                food.get('fiber_g', 0), food.get('sugar_g', 0), food.get('sodium_mg', 0), meal_type
+            ))
+        conn.commit()
+        conn.close()
+
+    def get_meals_by_date(self, date):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM meals WHERE date = ? ORDER BY timestamp', (date,))
+        meals = cursor.fetchall()
+        conn.close()
+        return meals
+
+    def delete_meal(self, meal_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM meals WHERE id = ?', (meal_id,))
+        conn.commit()
+        conn.close()
+
+    def get_date_range_stats(self, start_date, end_date):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT date, SUM(calories), SUM(protein), SUM(fat), SUM(carbs)
+            FROM meals 
+            WHERE date BETWEEN ? AND ?
+            GROUP BY date
+            ORDER BY date
+        ''', (start_date, end_date))
+        stats = cursor.fetchall()
+        conn.close()
+        return stats
+
+    def save_exercise(self, date, timestamp, exercise_name, duration_minutes, calories_burned, intensity='moderate'):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO exercises (date, timestamp, exercise_name, duration_minutes, calories_burned, intensity)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (date, timestamp, exercise_name, duration_minutes, calories_burned, intensity))
+        conn.commit()
+        conn.close()
+
+    def get_exercises_by_date(self, date):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM exercises WHERE date = ? ORDER BY timestamp', (date,))
+        exercises = cursor.fetchall()
+        conn.close()
+        return exercises
+
+    def delete_exercise(self, exercise_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM exercises WHERE id = ?', (exercise_id,))
+        conn.commit()
+        conn.close()
+
+    def save_water_intake(self, date, timestamp, amount_ml):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO water_intake (date, timestamp, amount_ml)
+            VALUES (?, ?, ?)
+        ''', (date, timestamp, amount_ml))
+        conn.commit()
+        conn.close()
+
+    def get_water_intake_by_date(self, date):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT SUM(amount_ml) FROM water_intake WHERE date = ?', (date,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result[0] else 0
+
+class SmartCalorieTrackerApp(customtkinter.CTk):
+    def __init__(self):
+        super().__init__()
+        self.db = DatabaseManager()
+        self.title("Calorie Tracker Pro")
+        self.geometry("1400x900")
+        customtkinter.set_appearance_mode("dark")
+        customtkinter.set_default_color_theme("blue")
+
+        self.target_calories = 2500.0
+        self.target_protein = 80.0
+        self.target_fat = 80.0
+        self.target_carbs = 300.0
+        self.target_water = 1200.0
+        self.target_exercise = 30.0
+
+        self.dietary_restrictions = ""
+        self.food_preferences = ""
+
+        self.totals = {
+            "calories": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0,
+            "fiber": 0.0, "sugar": 0.0, "sodium": 0.0, "water": 0.0, "exercise": 0.0, "exercise_calories": 0.0
+        }
+
+        self.current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        self.quick_add_foods = [
+            {"name": "Banana", "calories": 105, "protein_g": 1.3, "fat_g": 0.4, "carbs_g": 27},
+            {"name": "Apple", "calories": 95, "protein_g": 0.5, "fat_g": 0.3, "carbs_g": 25},
+            {"name": "Egg", "calories": 70, "protein_g": 6, "fat_g": 5, "carbs_g": 0.5},
+            {"name": "Chicken Breast (100g)", "calories": 165, "protein_g": 31, "fat_g": 3.6, "carbs_g": 0},
+            {"name": "Rice (1 cup)", "calories": 205, "protein_g": 4.3, "fat_g": 0.4, "carbs_g": 45},
+            {"name": "Milk (1 cup)", "calories": 150, "protein_g": 8, "fat_g": 8, "carbs_g": 12},
+            {"name": "Ghee Paratha", "calories": 300, "protein_g": 5, "fat_g": 15, "carbs_g": 40}
+        ]
+
+        self.setup_ui()
+        self.change_date(self.current_date)
+        self.bind("<Control-Left>", lambda e: self.prev_day())
+        self.bind("<Control-Right>", lambda e: self.next_day())
+
+    def change_date(self, new_date):
+        self.current_date = new_date
+        self.date_entry.delete(0, 'end')
+        self.date_entry.insert(0, self.current_date)
+        self.load_today_data()
+        self.update_summary()
+        self.update_charts()
+        self._update_log_displays()
+        self.status_label.configure(text=f"Displaying data for {self.current_date}")
+        self.update_motivational_message()
+
+    def load_today_data(self):
+        meals = self.db.get_meals_by_date(self.current_date)
+        exercises = self.db.get_exercises_by_date(self.current_date)
+        water_intake = self.db.get_water_intake_by_date(self.current_date)
+        self.totals = {
+            "calories": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0,
+            "fiber": 0.0, "sugar": 0.0, "sodium": 0.0,
+            "water": water_intake, "exercise": 0.0, "exercise_calories": 0.0
+        }
+        for meal in meals:
+            self.totals["calories"] += meal[4]
+            self.totals["protein"] += meal[5]
+            self.totals["fat"] += meal[6]
+            self.totals["carbs"] += meal[7]
+            self.totals["fiber"] += meal[8]
+            self.totals["sugar"] += meal[9]
+            self.totals["sodium"] += meal[10]
+        for exercise in exercises:
+            self.totals["exercise"] += exercise[4]
+            self.totals["exercise_calories"] += exercise[5]
+
+    def setup_ui(self):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # Sidebar
+        self.sidebar_frame = customtkinter.CTkFrame(self, width=250, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(13, weight=1)
+
+        self.logo_label = customtkinter.CTkLabel(self.sidebar_frame, text="🍎 Calorie Tracker Pro",
+                                                 font=customtkinter.CTkFont(size=20, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+
+        self.date_label = customtkinter.CTkLabel(self.sidebar_frame, text="Date:",
+                                                 font=customtkinter.CTkFont(size=14, weight="bold"))
+        self.date_label.grid(row=1, column=0, padx=20, pady=(10, 0), sticky="w")
+
+        self.date_entry = customtkinter.CTkEntry(self.sidebar_frame, placeholder_text=self.current_date)
+        self.date_entry.grid(row=2, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self.date_entry.bind("<Return>", lambda e: self.change_date(self.date_entry.get()))
+
+        nav_frame = customtkinter.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        nav_frame.grid(row=3, column=0, padx=20, pady=5, sticky="ew")
+        nav_frame.grid_columnconfigure((0, 1), weight=1)
+        self.prev_day_btn = customtkinter.CTkButton(nav_frame, text="← Prev", command=self.prev_day)
+        self.prev_day_btn.grid(row=0, column=0, padx=5, sticky="ew")
+        self.next_day_btn = customtkinter.CTkButton(nav_frame, text="Next →", command=self.next_day)
+        self.next_day_btn.grid(row=0, column=1, padx=5, sticky="ew")
+
+        self.quick_stats_label = customtkinter.CTkLabel(self.sidebar_frame, text="📊 Quick Stats",
+                                                        font=customtkinter.CTkFont(size=16, weight="bold"))
+        self.quick_stats_label.grid(row=4, column=0, padx=20, pady=(20, 10))
+        self.quick_cal_label = customtkinter.CTkLabel(self.sidebar_frame, text="Calories: 0/2500")
+        self.quick_cal_label.grid(row=5, column=0, padx=20, pady=2, sticky="w")
+        self.quick_protein_label = customtkinter.CTkLabel(self.sidebar_frame, text="Protein: 0/180g")
+        self.quick_protein_label.grid(row=6, column=0, padx=20, pady=2, sticky="w")
+        self.quick_water_label = customtkinter.CTkLabel(self.sidebar_frame, text="Water: 0/2000ml")
+        self.quick_water_label.grid(row=7, column=0, padx=20, pady=2, sticky="w")
+
+        self.motivational_label = customtkinter.CTkLabel(self.sidebar_frame, text="", font=customtkinter.CTkFont(size=12, weight="bold"),
+                                                       wraplength=230, justify="center")
+        self.motivational_label.grid(row=8, column=0, padx=20, pady=(10, 0), sticky="ew")
+
+        self.quick_actions_label = customtkinter.CTkLabel(self.sidebar_frame, text="⚡ Quick Actions",
+                                                          font=customtkinter.CTkFont(size=16, weight="bold"))
+        self.quick_actions_label.grid(row=9, column=0, padx=20, pady=(20, 10))
+        self.water_btn = customtkinter.CTkButton(self.sidebar_frame, text="💧 Add Water", command=self.quick_add_water)
+        self.water_btn.grid(row=10, column=0, padx=20, pady=5, sticky="ew")
+        self.exercise_btn = customtkinter.CTkButton(self.sidebar_frame, text="🏃 Add Exercise",
+                                                    command=lambda: self.tabview.set("🏃 Exercise"))
+        self.exercise_btn.grid(row=11, column=0, padx=20, pady=5, sticky="ew")
+        self.export_btn = customtkinter.CTkButton(self.sidebar_frame, text="📊 Export Data", command=self.export_data)
+        self.export_btn.grid(row=12, column=0, padx=20, pady=5, sticky="ew")
+
+        # Settings Section
+        settings_frame = customtkinter.CTkFrame(self.sidebar_frame)
+        settings_frame.grid(row=13, column=0, padx=20, pady=10, sticky="ew")
+        customtkinter.CTkLabel(settings_frame, text="Appearance").pack(pady=5)
+        appearance_var = customtkinter.StringVar(value="Dark")
+        appearance_menu = customtkinter.CTkOptionMenu(settings_frame, values=["Light", "Dark"], variable=appearance_var,
+                                                      command=lambda mode: customtkinter.set_appearance_mode(mode.lower()))
+        appearance_menu.pack(pady=5)
+        color_var = customtkinter.StringVar(value="Blue")
+        color_menu = customtkinter.CTkOptionMenu(settings_frame, values=["Blue", "Green", "Dark-Blue"], variable=color_var,
+                                                 command=lambda theme: customtkinter.set_default_color_theme(theme.lower()))
+        color_menu.pack(pady=5)
+
+        # Main Content
+        self.main_frame = customtkinter.CTkFrame(self, fg_color="transparent")
+        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(1, weight=1)
+
+        top_frame = customtkinter.CTkFrame(self.main_frame)
+        top_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top_frame.grid_columnconfigure(0, weight=1)
+
+        self.food_input_frame = customtkinter.CTkFrame(top_frame)
+        self.food_input_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        self.food_input_frame.grid_columnconfigure(1, weight=1)
+        customtkinter.CTkLabel(self.food_input_frame, text="What did you eat?",
+                               font=customtkinter.CTkFont(size=16, weight="bold")).grid(row=0, column=0, columnspan=4, pady=(5, 0))
+        self.meal_type_var = customtkinter.StringVar(value="snack")
+        self.meal_type_menu = customtkinter.CTkOptionMenu(self.food_input_frame,
+                                                          values=["breakfast", "lunch", "dinner", "snack"],
+                                                          variable=self.meal_type_var, width=120)
+        self.meal_type_menu.grid(row=1, column=0, padx=10, pady=5)
+        self.food_entry = customtkinter.CTkEntry(self.food_input_frame, height=40,
+                                                 placeholder_text="e.g., '2 large eggs, 1 slice of whole wheat toast with butter'")
+        self.food_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
+        self.food_entry.bind("<Return>", lambda e: self.process_food_entry())
+        self.add_button = customtkinter.CTkButton(self.food_input_frame, text="Add Food", command=self.process_food_entry, width=120)
+        self.add_button.grid(row=1, column=2, padx=10, pady=5)
+        self.photo_button = customtkinter.CTkButton(self.food_input_frame, text="📷 Photo", command=self.analyze_food_photo, width=100)
+        self.photo_button.grid(row=1, column=3, padx=10, pady=5)
+
+        self.quick_add_frame = customtkinter.CTkFrame(top_frame)
+        self.quick_add_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
+        self.quick_add_frame.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        customtkinter.CTkLabel(self.quick_add_frame, text="Quick Add:",
+                               font=customtkinter.CTkFont(size=14, weight="bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        for i, food in enumerate(self.quick_add_foods):
+            btn = customtkinter.CTkButton(self.quick_add_frame, text=food["name"],
+                                          command=lambda f=food: self.quick_add_food(f),
+                                          width=120, height=30)
+            btn.grid(row=0, column=i + 1, padx=5, pady=5)
+
+        self.tabview = customtkinter.CTkTabview(self.main_frame)
+        self.tabview.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        self.tabview.add("📋 Daily Log")
+        self.tabview.add("📊 Charts")
+        self.tabview.add("🤖 AI Analysis")
+        self.tabview.add("🏃 Exercise")
+        self.tabview.add("📈 History")
+        self.tabview.add("🍽️ Meal Planner")
+        self.tabview.add("⚙️ Goals")
+        self.tabview.add("❓ Nutrition Q&A")
+
+        self.setup_food_log_tab()
+        self.setup_charts_tab()
+        self.setup_ai_analysis_tab()
+        self.setup_exercise_tab()
+        self.setup_history_tab()
+        self.setup_meal_planner_tab()
+        self.setup_goals_tab()
+        self.setup_nutrition_qa_tab()
+
+        self.status_frame = customtkinter.CTkFrame(self, height=40)
+        self.status_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        self.status_label = customtkinter.CTkLabel(self.status_frame, text="Ready to track your meals!", text_color="gray")
+        self.status_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        self.progress_bar = customtkinter.CTkProgressBar(self.status_frame, width=200, mode="indeterminate")
+        self.progress_bar.grid(row=0, column=1, padx=10, pady=5, sticky="e")
+        self.progress_bar.set(0)
+        self.status_frame.grid_columnconfigure(0, weight=1)
+
+    def setup_food_log_tab(self):
+        tab = self.tabview.tab("📋 Daily Log")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        self.summary_frame = customtkinter.CTkFrame(tab)
+        self.summary_frame.grid(row=0, column=0, sticky="new", padx=10, pady=10)
+        self.summary_frame.grid_columnconfigure((0, 1), weight=1)
+        self.create_progress_bars()
+        self.food_entries_frame = customtkinter.CTkScrollableFrame(tab, label_text="Today's Meal Entries")
+        self.food_entries_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        self.food_entries_frame.grid_columnconfigure(0, weight=1)
+
+    def create_progress_bars(self):
+        self.calories_label = customtkinter.CTkLabel(self.summary_frame, text="",
+                                                     font=customtkinter.CTkFont(size=14, weight="bold"))
+        self.calories_label.grid(row=0, column=0, padx=20, pady=5, sticky="w")
+        self.calories_progress = customtkinter.CTkProgressBar(self.summary_frame, height=20)
+        self.calories_progress.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.protein_label = customtkinter.CTkLabel(self.summary_frame, text="",
+                                                    font=customtkinter.CTkFont(size=14, weight="bold"))
+        self.protein_label.grid(row=2, column=0, padx=20, pady=5, sticky="w")
+        self.protein_progress = customtkinter.CTkProgressBar(self.summary_frame, height=20, progress_color="#3498db")
+        self.protein_progress.grid(row=3, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.fat_label = customtkinter.CTkLabel(self.summary_frame, text="",
+                                                font=customtkinter.CTkFont(size=14, weight="bold"))
+        self.fat_label.grid(row=0, column=1, padx=20, pady=5, sticky="w")
+        self.fat_progress = customtkinter.CTkProgressBar(self.summary_frame, height=20, progress_color="#f1c40f")
+        self.fat_progress.grid(row=1, column=1, padx=20, pady=(0, 10), sticky="ew")
+        self.carbs_label = customtkinter.CTkLabel(self.summary_frame, text="",
+                                                  font=customtkinter.CTkFont(size=14, weight="bold"))
+        self.carbs_label.grid(row=2, column=1, padx=20, pady=5, sticky="w")
+        self.carbs_progress = customtkinter.CTkProgressBar(self.summary_frame, height=20, progress_color="#e74c3c")
+        self.carbs_progress.grid(row=3, column=1, padx=20, pady=(0, 10), sticky="ew")
+        self.water_label = customtkinter.CTkLabel(self.summary_frame, text="",
+                                                  font=customtkinter.CTkFont(size=14, weight="bold"))
+        self.water_label.grid(row=4, column=0, padx=20, pady=5, sticky="w")
+        self.water_progress = customtkinter.CTkProgressBar(self.summary_frame, height=20, progress_color="#2ecc71")
+        self.water_progress.grid(row=5, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.exercise_label = customtkinter.CTkLabel(self.summary_frame, text="",
+                                                     font=customtkinter.CTkFont(size=14, weight="bold"))
+        self.exercise_label.grid(row=4, column=1, padx=20, pady=5, sticky="w")
+        self.exercise_progress = customtkinter.CTkProgressBar(self.summary_frame, height=20, progress_color="#9b59b6")
+        self.exercise_progress.grid(row=5, column=1, padx=20, pady=(0, 10), sticky="ew")
+
+    def setup_charts_tab(self):
+        tab = self.tabview.tab("📊 Charts")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        chart_frame = customtkinter.CTkFrame(tab)
+        chart_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        chart_frame.grid_columnconfigure(0, weight=1)
+        chart_frame.grid_rowconfigure(0, weight=1)
+        self.fig, self.axs = plt.subplots(2, 2, figsize=(12, 8), tight_layout=True)
+        self.fig.patch.set_facecolor('#2B2B2B')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+    def setup_ai_analysis_tab(self):
+        tab = self.tabview.tab("🤖 AI Analysis")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+        customtkinter.CTkLabel(tab, text="Get AI-Powered Insights on Your Diet",
+                               font=customtkinter.CTkFont(size=18, weight="bold")).grid(row=0, column=0, padx=20, pady=10)
+        self.ai_prompt_entry = customtkinter.CTkTextbox(tab, height=80)
+        self.ai_prompt_entry.insert("1.0", "Based on my consumption today, what is one healthy change I could make tomorrow?")
+        self.ai_prompt_entry.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+        self.ai_ask_button = customtkinter.CTkButton(tab, text="Ask Gemini", command=self.get_ai_analysis)
+        self.ai_ask_button.grid(row=1, column=1, padx=20, pady=10)
+        self.ai_response_box = customtkinter.CTkTextbox(tab, state="disabled", wrap="word")
+        self.ai_response_box.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=20, pady=10)
+        self.ai_progress = customtkinter.CTkProgressBar(tab, mode="indeterminate")
+        self.ai_progress.grid(row=3, column=0, columnspan=2, padx=20, pady=10)
+
+    def setup_exercise_tab(self):
+        tab = self.tabview.tab("🏃 Exercise")
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        add_frame = customtkinter.CTkFrame(tab)
+        add_frame.grid(row=0, column=0, rowspan=2, padx=10, pady=10, sticky="ns")
+        customtkinter.CTkLabel(add_frame, text="Log New Exercise",
+                               font=customtkinter.CTkFont(size=16, weight="bold")).grid(row=0, column=0, columnspan=2, padx=10, pady=10)
+        customtkinter.CTkLabel(add_frame, text="Exercise:").grid(row=1, column=0, padx=10, pady=5, sticky="e")
+        self.ex_name_entry = customtkinter.CTkEntry(add_frame, placeholder_text="e.g., Running")
+        self.ex_name_entry.grid(row=1, column=1, padx=10, pady=5)
+        customtkinter.CTkLabel(add_frame, text="Duration (min):").grid(row=2, column=0, padx=10, pady=5, sticky="e")
+        self.ex_duration_entry = customtkinter.CTkEntry(add_frame, placeholder_text="e.g., 30")
+        self.ex_duration_entry.grid(row=2, column=1, padx=10, pady=5)
+        vcmd = self.register(self.validate_number)
+        self.ex_duration_entry.configure(validate="key", validatecommand=(vcmd, '%P'))
+        customtkinter.CTkLabel(add_frame, text="Calories Burned:").grid(row=3, column=0, padx=10, pady=5, sticky="e")
+        self.ex_calories_entry = customtkinter.CTkEntry(add_frame, placeholder_text="e.g., 350 (optional)")
+        self.ex_calories_entry.grid(row=3, column=1, padx=10, pady=5)
+        self.ex_calories_entry.configure(validate="key", validatecommand=(vcmd, '%P'))
+        self.add_exercise_button = customtkinter.CTkButton(add_frame, text="Add Exercise", command=self.add_exercise)
+        self.add_exercise_button.grid(row=4, column=0, columnspan=2, padx=10, pady=20)
+        self.exercise_log_frame = customtkinter.CTkScrollableFrame(tab, label_text=f"Exercise Log for {self.current_date}")
+        self.exercise_log_frame.grid(row=0, column=1, rowspan=2, padx=10, pady=10, sticky="nsew")
+        self.exercise_log_frame.grid_columnconfigure(0, weight=1)
+
+    def validate_number(self, P):
+        return P == "" or P.isdigit()
+
+    def setup_history_tab(self):
+        tab = self.tabview.tab("📈 History")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        controls_frame = customtkinter.CTkFrame(tab)
+        controls_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        yesterday = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+        customtkinter.CTkLabel(controls_frame, text="Start Date:").pack(side="left", padx=10)
+        self.history_start_date = customtkinter.CTkEntry(controls_frame)
+        self.history_start_date.insert(0, yesterday)
+        self.history_start_date.pack(side="left", padx=5)
+        customtkinter.CTkLabel(controls_frame, text="End Date:").pack(side="left", padx=10)
+        self.history_end_date = customtkinter.CTkEntry(controls_frame)
+        self.history_end_date.insert(0, self.current_date)
+        self.history_end_date.pack(side="left", padx=5)
+        self.show_history_btn = customtkinter.CTkButton(controls_frame, text="Show History", command=self.show_history)
+        self.show_history_btn.pack(side="left", padx=20)
+        self.history_textbox = customtkinter.CTkTextbox(tab, state="disabled", wrap="none", font=("Courier", 12))
+        self.history_textbox.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+
+    def setup_meal_planner_tab(self):
+        tab = self.tabview.tab("🍽️ Meal Planner")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        controls_frame = customtkinter.CTkFrame(tab)
+        controls_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        customtkinter.CTkLabel(controls_frame, text="Target Calories:").pack(side="left", padx=10)
+        self.plan_cal_entry = customtkinter.CTkEntry(controls_frame, placeholder_text=str(int(self.target_calories)))
+        self.plan_cal_entry.pack(side="left", padx=5)
+        customtkinter.CTkLabel(controls_frame, text="Diet Type:").pack(side="left", padx=10)
+        self.plan_diet_var = customtkinter.StringVar(value="Balanced")
+        self.plan_diet_menu = customtkinter.CTkOptionMenu(controls_frame,
+                                                          values=["Balanced", "High-Protein", "Low-Carb", "Vegetarian", "Vegan"],
+                                                          variable=self.plan_diet_var)
+        self.plan_diet_menu.pack(side="left", padx=5)
+        self.generate_plan_btn = customtkinter.CTkButton(controls_frame, text="Generate Meal Plan", command=self.generate_meal_plan)
+        self.generate_plan_btn.pack(side="left", padx=20)
+        self.meal_plan_textbox = customtkinter.CTkTextbox(tab, state="disabled", wrap="word")
+        self.meal_plan_textbox.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        self.plan_progress = customtkinter.CTkProgressBar(tab, mode="indeterminate")
+        self.plan_progress.grid(row=2, column=0, padx=20, pady=10)
+
+    def setup_goals_tab(self):
+        tab = self.tabview.tab("⚙️ Goals")
+        goals_frame = customtkinter.CTkFrame(tab)
+        goals_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        customtkinter.CTkLabel(goals_frame, text="Set Your Daily Goals",
+                               font=customtkinter.CTkFont(size=18, weight="bold")).grid(row=0, column=0, columnspan=2, pady=20)
+        labels = ["Calories (kcal):", "Protein (g):", "Fat (g):", "Carbs (g):", "Water (ml):", "Exercise (min):"]
+        for i, label_text in enumerate(labels):
+            customtkinter.CTkLabel(goals_frame, text=label_text).grid(row=i + 1, column=0, padx=20, pady=10, sticky="e")
+        self.cal_goal_entry = customtkinter.CTkEntry(goals_frame, placeholder_text=str(int(self.target_calories)))
+        self.cal_goal_entry.grid(row=1, column=1, padx=20, pady=10)
+        self.prot_goal_entry = customtkinter.CTkEntry(goals_frame, placeholder_text=str(int(self.target_protein)))
+        self.prot_goal_entry.grid(row=2, column=1, padx=20, pady=10)
+        self.fat_goal_entry = customtkinter.CTkEntry(goals_frame, placeholder_text=str(int(self.target_fat)))
+        self.fat_goal_entry.grid(row=3, column=1, padx=20, pady=10)
+        self.carb_goal_entry = customtkinter.CTkEntry(goals_frame, placeholder_text=str(int(self.target_carbs)))
+        self.carb_goal_entry.grid(row=4, column=1, padx=20, pady=10)
+        self.water_goal_entry = customtkinter.CTkEntry(goals_frame, placeholder_text=str(int(self.target_water)))
+        self.water_goal_entry.grid(row=5, column=1, padx=20, pady=10)
+        self.exercise_goal_entry = customtkinter.CTkEntry(goals_frame, placeholder_text=str(int(self.target_exercise)))
+        self.exercise_goal_entry.grid(row=6, column=1, padx=20, pady=10)
+
+        customtkinter.CTkLabel(goals_frame, text="Dietary Restrictions:").grid(row=7, column=0, padx=20, pady=10, sticky="e")
+        self.diet_restrict_entry = customtkinter.CTkEntry(goals_frame, placeholder_text="e.g., Vegetarian, Gluten-Free")
+        self.diet_restrict_entry.grid(row=7, column=1, padx=20, pady=10)
+
+        customtkinter.CTkLabel(goals_frame, text="Food Preferences/Dislikes:").grid(row=8, column=0, padx=20, pady=10, sticky="e")
+        self.food_pref_entry = customtkinter.CTkEntry(goals_frame, placeholder_text="e.g., No seafood, Likes spicy")
+        self.food_pref_entry.grid(row=8, column=1, padx=20, pady=10)
+
+        self.update_goals_button = customtkinter.CTkButton(goals_frame, text="Update Goals", command=self.update_goals)
+        self.update_goals_button.grid(row=9, column=0, columnspan=2, pady=30)
+
+    def setup_nutrition_qa_tab(self):
+        tab = self.tabview.tab("❓ Nutrition Q&A")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+        customtkinter.CTkLabel(tab, text="Ask Gemini About Nutrition",
+                               font=customtkinter.CTkFont(size=18, weight="bold")).grid(row=0, column=0, padx=20, pady=10)
+        self.qa_prompt_entry = customtkinter.CTkTextbox(tab, height=80)
+        self.qa_prompt_entry.insert("1.0", "e.g., How many calories in a medium-sized banana?")
+        self.qa_prompt_entry.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+        self.qa_ask_button = customtkinter.CTkButton(tab, text="Ask Gemini", command=self.get_nutrition_qa)
+        self.qa_ask_button.grid(row=1, column=1, padx=20, pady=10)
+        self.qa_response_box = customtkinter.CTkTextbox(tab, state="disabled", wrap="word")
+        self.qa_response_box.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=20, pady=10)
+        self.qa_progress = customtkinter.CTkProgressBar(tab, mode="indeterminate")
+        self.qa_progress.grid(row=3, column=0, columnspan=2, padx=20, pady=10)
+
+    def process_food_entry(self):
+        food_text = self.food_entry.get()
+        if not food_text:
+            messagebox.showwarning("Input Error", "Please enter a food description.")
+            return
+        self._start_processing("Analyzing food...")
+        threading.Thread(target=self._get_nutrition_data_worker, args=(food_text,), daemon=True).start()
+
+    def _get_nutrition_data_worker(self, food_text):
+        try:
+            prompt = f"""
+            Analyze the following food description and return a detailed nutritional breakdown in a clean JSON format.
+            The JSON object should have a key "foods" which is an array of food items.
+            For each item, provide: name, calories, protein_g, fat_g, and carbs_g.
+            Also include fiber_g, sugar_g, and sodium_mg if available.
+            Food description: "{food_text}"
+            """
+            response = model.generate_content(prompt)
+            cleaned_response = response.text.strip()
+            if cleaned_response.startswith("```json"):
+                cleaned_response = cleaned_response[7:]
+            if cleaned_response.endswith("```"):
+                cleaned_response = cleaned_response[:-3]
+            nutrition_data = json.loads(cleaned_response)
+            self.after(0, self._update_ui_after_processing, nutrition_data, food_text)
+        except Exception as e:
+            self.after(0, self._processing_error, f"AI analysis failed. Please try a different description. Error: {e}")
+
+    def _update_ui_after_processing(self, nutrition_data, food_text):
+        date = self.current_date
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        meal_type = self.meal_type_var.get()
+        self.db.save_meal(date, timestamp, food_text, nutrition_data, meal_type)
+        self.load_today_data()
+        self.update_summary()
+        self.update_charts()
+        self._update_log_displays()
+        self.food_entry.delete(0, 'end')
+        self._end_processing("Food added successfully!")
+
+    def _start_processing(self, message):
+        self.status_label.configure(text=message)
+        self.progress_bar.start()
+        self.add_button.configure(state="disabled")
+        self.photo_button.configure(state="disabled")
+
+    def _end_processing(self, message):
+        self.status_label.configure(text=message)
+        self.progress_bar.stop()
+        self.progress_bar.set(0)
+        self.add_button.configure(state="normal")
+        self.photo_button.configure(state="normal")
+
+    def _processing_error(self, message):
+        messagebox.showerror("Error", message)
+        self._end_processing("Ready.")
+
+    def quick_add_food(self, food_data):
+        date = self.current_date
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        meal_type = self.meal_type_var.get()
+        wrapped_data = {"foods": [food_data]}
+        self.db.save_meal(date, timestamp, food_data['name'], wrapped_data, meal_type)
+        self.load_today_data()
+        self.update_summary()
+        self.update_charts()
+        self._update_log_displays()
+        self.status_label.configure(text=f"Quick added: {food_data['name']}")
+
+    def analyze_food_photo(self):
+        filepath = filedialog.askopenfilename(
+            title="Select a Food Photo",
+            filetypes=(("Image Files", "*.jpg *.jpeg *.png *.webp"), ("All files", "*.*"))
+        )
+        if not filepath:
+            return
+        try:
+            self._start_processing("Analyzing photo...")
+            image = Image.open(filepath)
+            threading.Thread(target=self._analyze_photo_worker, args=(image,), daemon=True).start()
+        except Exception as e:
+            self._processing_error(f"Could not open image file. Error: {e}")
+
+    def _analyze_photo_worker(self, image):
+        try:
+            prompt = "Analyze this image of food. Identify the items and quantities. Provide a descriptive string for the food entry box."
+            response = model.generate_content([prompt, image])
+            self.after(0, self._update_entry_from_photo, response.text)
+        except Exception as e:
+            self.after(0, self._processing_error, f"Photo analysis failed. Error: {e}")
+
+    def _update_entry_from_photo(self, description):
+        self.food_entry.delete(0, 'end')
+        self.food_entry.insert(0, description.strip())
+        self._end_processing("Photo analysis complete. Review and add the food.")
+
+    def update_summary(self):
+        net_calories = self.totals['calories'] - self.totals['exercise_calories']
+        for key in ["calories", "protein", "fat", "carbs", "water", "exercise"]:
+            progress_widget = getattr(self, f"{key}_progress")
+            label_widget = getattr(self, f"{key}_label")
+            total = self.totals[key]
+            target = getattr(self, f"target_{key}")
+            display_total = net_calories if key == 'calories' else total
+            progress = (display_total / target) if target > 0 else 0
+            progress_widget.set(min(progress, 1.0))
+            unit = "g" if key in ["protein", "fat", "carbs"] else "ml" if key == "water" else "min" if key == "exercise" else "kcal"
+            if key == 'calories':
+                label_widget.configure(text=f"Net Calories: {net_calories:,.0f} / {self.target_calories:,.0f} kcal")
+                progress_widget.configure(progress_color="red" if net_calories > self.target_calories else "green")
+            else:
+                label_widget.configure(text=f"{key.capitalize()}: {total:,.1f} / {target:,.1f} {unit}")
+        self.quick_cal_label.configure(text=f"Net Cals: {net_calories:,.0f} / {self.target_calories:,.0f}")
+        self.quick_protein_label.configure(text=f"Protein: {self.totals['protein']:.0f} / {self.target_protein:.0f}g")
+        self.quick_water_label.configure(text=f"Water: {self.totals['water']:.0f} / {self.target_water:.0f}ml")
+
+    def _update_log_displays(self):
+        for widget in self.food_entries_frame.winfo_children():
+            widget.destroy()
+        for widget in self.exercise_log_frame.winfo_children():
+            widget.destroy()
+        meals = self.db.get_meals_by_date(self.current_date)
+        if not meals:
+            customtkinter.CTkLabel(self.food_entries_frame, text="No meals logged for this day.").pack(pady=20)
+        for i, meal in enumerate(meals):
+            entry_frame = customtkinter.CTkFrame(self.food_entries_frame)
+            entry_frame.grid(row=i, column=0, sticky="ew", pady=5)
+            entry_frame.grid_columnconfigure(0, weight=1)
+            header = f"{meal[2]} - {meal[11].capitalize()}: {meal[3]}"
+            details = f"{meal[4]:.0f} kcal | P: {meal[5]:.1f}g | F: {meal[6]:.1f}g | C: {meal[7]:.1f}g"
+            customtkinter.CTkLabel(entry_frame, text=header, anchor="w").grid(row=0, column=0, padx=10, pady=(5, 0), sticky="ew")
+            customtkinter.CTkLabel(entry_frame, text=details, anchor="w", text_color="gray").grid(row=1, column=0, padx=10, pady=(0, 5), sticky="ew")
+            delete_btn = customtkinter.CTkButton(entry_frame, text="X", width=30, command=lambda id=meal[0]: self.delete_meal(id))
+            delete_btn.grid(row=0, column=1, rowspan=2, padx=5)
+        self.exercise_log_frame.configure(label_text=f"Exercise Log for {self.current_date}")
+        exercises = self.db.get_exercises_by_date(self.current_date)
+        if not exercises:
+            customtkinter.CTkLabel(self.exercise_log_frame, text="No exercise logged for this day.").pack(pady=20)
+        for i, ex in enumerate(exercises):
+            entry_frame = customtkinter.CTkFrame(self.exercise_log_frame)
+            entry_frame.pack(fill="x", pady=5)
+            details = f"{ex[2]} - {ex[3]}: {ex[4]:.0f} min, {ex[5]:.0f} kcal burned"
+            customtkinter.CTkLabel(entry_frame, text=details, anchor="w").pack(padx=10, pady=5, fill="x")
+            delete_btn = customtkinter.CTkButton(entry_frame, text="X", width=30, command=lambda id=ex[0]: self.delete_exercise(id))
+            delete_btn.pack(side="right", padx=5)
+
+    def delete_meal(self, meal_id):
+        if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this meal entry?"):
+            self.db.delete_meal(meal_id)
+            self.load_today_data()
+            self.update_summary()
+            self.update_charts()
+            self._update_log_displays()
+
+    def delete_exercise(self, exercise_id):
+        if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this exercise entry?"):
+            self.db.delete_exercise(exercise_id)
+            self.load_today_data()
+            self.update_summary()
+            self.update_charts()
+            self._update_log_displays()
+
+    def update_charts(self):
+        for i in range(2):
+            for j in range(2):
+                self.axs[i, j].clear()
+                self.axs[i, j].set_facecolor("#3D3D3D")
+                plt.setp(self.axs[i, j].get_xticklabels(), color="white")
+                plt.setp(self.axs[i, j].get_yticklabels(), color="white")
+                self.axs[i, j].spines['bottom'].set_color('white')
+                self.axs[i, j].spines['top'].set_color('white')
+                self.axs[i, j].spines['right'].set_color('white')
+                self.axs[i, j].spines['left'].set_color('white')
+                self.axs[i, j].title.set_color('white')
+                self.axs[i, j].xaxis.label.set_color('white')
+                self.axs[i, j].yaxis.label.set_color('white')
+        macros = [self.totals['protein'] * 4, self.totals['fat'] * 9, self.totals['carbs'] * 4]
+        labels = ['Protein', 'Fat', 'Carbs']
+        colors = ['#3498db', '#f1c40f', '#e74c3c']
+        non_zero_macros = [(m, l, c) for m, l, c in zip(macros, labels, colors) if m > 0]
+        if non_zero_macros:
+            macros, labels, colors = zip(*non_zero_macros)
+            self.axs[0, 0].pie(macros, labels=labels, autopct='%1.1f%%', startangle=90, colors=colors, textprops={'color': "w"})
+        self.axs[0, 0].set_title("Daily Macronutrient Distribution (by kcal)")
+        end_date = datetime.datetime.strptime(self.current_date, "%Y-%m-%d")
+        start_date = end_date - datetime.timedelta(days=6)
+        stats = self.db.get_date_range_stats(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        if stats:
+            dates, cals, _, _, _ = zip(*stats)
+            self.axs[0, 1].plot(dates, cals, marker='o', linestyle='-', color='#2ecc71')
+            self.axs[0, 1].axhline(y=self.target_calories, color='r', linestyle='--', label='Goal')
+            self.axs[0, 1].legend()
+        self.axs[0, 1].set_title("Calorie Intake (Last 7 Days)")
+        self.axs[0, 1].tick_params(axis='x', rotation=45)
+        meals = self.db.get_meals_by_date(self.current_date)
+        meal_cals = {'breakfast': 0, 'lunch': 0, 'dinner': 0, 'snack': 0}
+        for meal in meals:
+            meal_cals[meal[11]] += meal[4]
+        if any(meal_cals.values()):
+            self.axs[1, 0].bar(meal_cals.keys(), meal_cals.values(), color=['#e67e22', '#3498db', '#9b59b6', '#2c3e50'])
+        self.axs[1, 0].set_title("Calories by Meal Type")
+        items = ['Water (ml)', 'Exercise (min)']
+        currents = [self.totals['water'], self.totals['exercise']]
+        targets = [self.target_water, self.target_exercise]
+        x = np.arange(len(items))
+        width = 0.35
+        self.axs[1, 1].bar(x - width / 2, currents, width, label='Current', color='#1abc9c')
+        self.axs[1, 1].bar(x + width / 2, targets, width, label='Goal', color='#34495e')
+        self.axs[1, 1].set_ylabel('Amount')
+        self.axs[1, 1].set_title('Water & Exercise Progress')
+        self.axs[1, 1].set_xticks(x, items)
+        self.axs[1, 1].legend()
+        self.canvas.draw()
+
+    def prev_day(self):
+        current = datetime.datetime.strptime(self.current_date, "%Y-%m-%d")
+        prev = current - datetime.timedelta(days=1)
+        self.change_date(prev.strftime("%Y-%m-%d"))
+
+    def next_day(self):
+        current = datetime.datetime.strptime(self.current_date, "%Y-%m-%d")
+        next_d = current + datetime.timedelta(days=1)
+        self.change_date(next_d.strftime("%Y-%m-%d"))
+
+    def update_goals(self):
+        try:
+            self.target_calories = float(self.cal_goal_entry.get() or self.target_calories)
+            self.target_protein = float(self.prot_goal_entry.get() or self.target_protein)
+            self.target_fat = float(self.fat_goal_entry.get() or self.target_fat)
+            self.target_carbs = float(self.carb_goal_entry.get() or self.target_carbs)
+            self.target_water = float(self.water_goal_entry.get() or self.target_water)
+            self.target_exercise = float(self.exercise_goal_entry.get() or self.target_exercise)
+
+            self.dietary_restrictions = self.diet_restrict_entry.get()
+            self.food_preferences = self.food_pref_entry.get()
+
+            messagebox.showinfo("Success", "Goals updated successfully!")
+            self.update_summary()
+            self.update_charts()
+        except ValueError:
+            messagebox.showerror("Input Error", "Please enter valid numbers for all goals.")
+
+    def get_nutrition_qa(self):
+        prompt = self.qa_prompt_entry.get("1.0", "end-1c")
+        if not prompt:
+            messagebox.showwarning("Input Error", "Please enter a question.")
+            return
+        self.qa_response_box.configure(state="normal")
+        self.qa_response_box.delete("1.0", "end")
+        self.qa_response_box.insert("1.0", "Asking Gemini...")
+        self.qa_response_box.configure(state="disabled")
+        self.qa_progress.start()
+        threading.Thread(target=self._get_nutrition_qa_worker, args=(prompt,), daemon=True).start()
+
+    def _get_nutrition_qa_worker(self, user_prompt):
+        try:
+            prompt = f"""
+            You are a helpful nutrition assistant. Please answer the following question about food and nutrition.
+            Provide a concise and easy-to-understand answer.
+            Question: "{user_prompt}"
+            """
+            response = model.generate_content(prompt)
+            self.after(0, self._update_qa_response_box, response.text)
+        except Exception as e:
+            self.after(0, self._update_qa_response_box, f"An error occurred: {e}")
+        finally:
+            self.after(0, self.qa_progress.stop)
+
+    def _update_qa_response_box(self, text):
+        self.qa_response_box.configure(state="normal")
+        self.qa_response_box.delete("1.0", "end")
+        self.qa_response_box.insert("1.0", text)
+        self.qa_response_box.configure(state="disabled")
+
+    def quick_add_water(self):
+        amount = simpledialog.askinteger("Add Water", "Enter amount of water (ml):", parent=self, minvalue=1, maxvalue=5000)
+        if amount:
+            date = self.current_date
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.db.save_water_intake(date, timestamp, amount)
+            self.load_today_data()
+            self.update_summary()
+            self.update_charts()
+            self.status_label.configure(text=f"Added {amount}ml of water.")
+
+    def add_exercise(self):
+        name = self.ex_name_entry.get()
+        duration_str = self.ex_duration_entry.get()
+        calories_str = self.ex_calories_entry.get()
+        if not name or not duration_str:
+            messagebox.showerror("Input Error", "Please provide an exercise name and duration.")
+            return
+        try:
+            duration = float(duration_str)
+            calories_burned = float(calories_str) if calories_str else duration * 7.5
+        except ValueError:
+            messagebox.showerror("Input Error", "Please enter valid numbers for duration and calories.")
+            return
+        date = self.current_date
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.db.save_exercise(date, timestamp, name, duration, calories_burned)
+        self.load_today_data()
+        self.update_summary()
+        self.update_charts()
+        self._update_log_displays()
+        self.ex_name_entry.delete(0, 'end')
+        self.ex_duration_entry.delete(0, 'end')
+        self.ex_calories_entry.delete(0, 'end')
+        self.status_label.configure(text=f"Added exercise: {name}")
+
+    def get_ai_analysis(self):
+        prompt = self.ai_prompt_entry.get("1.0", "end-1c")
+        if not prompt:
+            messagebox.showwarning("Input Error", "Please enter a question for the AI.")
+            return
+        self.ai_response_box.configure(state="normal")
+        self.ai_response_box.delete("1.0", "end")
+        self.ai_response_box.insert("1.0", "AI is thinking...")
+        self.ai_response_box.configure(state="disabled")
+        self.ai_progress.start()
+        threading.Thread(target=self._get_ai_analysis_worker, args=(prompt,), daemon=True).start()
+
+    def _get_ai_analysis_worker(self, user_prompt):
+        try:
+            context = f"""
+            Here is my nutritional intake for today so far:
+            - Calories: {self.totals['calories']:.0f} / {self.target_calories:.0f} kcal
+            - Protein: {self.totals['protein']:.1f} / {self.target_protein:.1f} g
+            - Fat: {self.totals['fat']:.1f} / {self.target_fat:.1f} g
+            - Carbs: {self.totals['carbs']:.1f} / {self.target_carbs:.1f} g
+            - Water: {self.totals['water']:.0f} / {self.target_water:.0f} ml
+            - Exercise: {self.totals['exercise']:.0f} / {self.target_exercise:.0f} min
+
+            Additional information about my dietary needs:
+            - Restrictions: {self.dietary_restrictions if self.dietary_restrictions else "None"}
+            - Preferences/Dislikes: {self.food_preferences if self.food_preferences else "None"}
+
+            Based on this data, please answer: "{user_prompt}"
+            """
+            response = model.generate_content(context)
+            self.after(0, self._update_ai_response_box, response.text)
+        except Exception as e:
+            self.after(0, self._update_ai_response_box, f"An error occurred: {e}")
+        finally:
+            self.after(0, self.ai_progress.stop)
+
+    def _update_ai_response_box(self, text):
+        self.ai_response_box.configure(state="normal")
+        self.ai_response_box.delete("1.0", "end")
+        self.ai_response_box.insert("1.0", text)
+        self.ai_response_box.configure(state="disabled")
+
+    def show_history(self):
+        start = self.history_start_date.get()
+        end = self.history_end_date.get()
+        try:
+            stats = self.db.get_date_range_stats(start, end)
+            self.history_textbox.configure(state="normal")
+            self.history_textbox.delete("1.0", "end")
+            if not stats:
+                self.history_textbox.insert("1.0", "No data found for the selected date range.")
+            else:
+                header = f"{'Date':<12} | {'Calories':>10} | {'Protein (g)':>12} | {'Fat (g)':>10} | {'Carbs (g)':>10}\n"
+                separator = "-" * len(header) + "\n"
+                self.history_textbox.insert("1.0", header + separator)
+                for row in stats:
+                    line = f"{row[0]:<12} | {row[1]:>10.0f} | {row[2]:>12.1f} | {row[3]:>10.1f} | {row[4]:>10.1f}\n"
+                    self.history_textbox.insert("end", line)
+            self.history_textbox.configure(state="disabled")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to fetch history. Check date format (YYYY-MM-DD). Error: {e}")
+
+    def generate_meal_plan(self):
+        cals = self.plan_cal_entry.get() or str(int(self.target_calories))
+        diet = self.plan_diet_var.get()
+        self.meal_plan_textbox.configure(state="normal")
+        self.meal_plan_textbox.delete("1.0", "end")
+        self.meal_plan_textbox.insert("1.0", "Generating your personalized meal plan...")
+        self.meal_plan_textbox.configure(state="disabled")
+        self.plan_progress.start()
+        threading.Thread(target=self._generate_meal_plan_worker, args=(cals, diet), daemon=True).start()
+
+    def _generate_meal_plan_worker(self, cals, diet):
+        try:
+            prompt = f"""
+            Create a one-day sample meal plan for a '{diet}' diet, targeting approximately {cals} calories.
+            Consider the following dietary information:
+            - Restrictions: {self.dietary_restrictions if self.dietary_restrictions else "None"}
+            - Preferences/Dislikes: {self.food_preferences if self.food_preferences else "None"}
+
+            Structure the response with sections for Breakfast, Lunch, Dinner, and Snacks.
+            For each meal, list the food items and their estimated nutritional values (calories, protein, fat, carbs).
+            Provide a total summary at the end. Make it easy to read.
+            """
+            response = model.generate_content(prompt)
+            self.after(0, self._update_meal_plan_box, response.text)
+        except Exception as e:
+            self.after(0, self._update_meal_plan_box, f"An error occurred: {e}")
+        finally:
+            self.after(0, self.plan_progress.stop)
+
+    def _update_meal_plan_box(self, text):
+        self.meal_plan_textbox.configure(state="normal")
+        self.meal_plan_textbox.delete("1.0", "end")
+        self.meal_plan_textbox.insert("1.0", text)
+        self.meal_plan_textbox.configure(state="disabled")
+
+    def export_data(self):
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile=f"calorie_log_{self.current_date}.csv",
+            title="Save Daily Log As"
+        )
+        if not filepath:
+            return
+        try:
+            meals = self.db.get_meals_by_date(self.current_date)
+            exercises = self.db.get_exercises_by_date(self.current_date)
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([f"Data for Date:", self.current_date])
+                writer.writerow(["Category", "Total", "Target"])
+                writer.writerow(["Calories (kcal)", self.totals['calories'], self.target_calories])
+                writer.writerow(["Protein (g)", self.totals['protein'], self.target_protein])
+                writer.writerow(["Fat (g)", self.totals['fat'], self.target_fat])
+                writer.writerow(["Carbs (g)", self.totals['carbs'], self.target_carbs])
+                writer.writerow(["Water (ml)", self.totals['water'], self.target_water])
+                writer.writerow(["Exercise (min)", self.totals['exercise'], self.target_exercise])
+                writer.writerow([])
+                writer.writerow(["MEALS"])
+                writer.writerow(['ID', 'Date', 'Timestamp', 'Description', 'Calories', 'Protein', 'Fat', 'Carbs', 'Fiber', 'Sugar', 'Sodium', 'Meal Type'])
+                for meal in meals:
+                    writer.writerow(meal)
+                writer.writerow([])
+                writer.writerow(["EXERCISES"])
+                writer.writerow(['ID', 'Date', 'Timestamp', 'Name', 'Duration (min)', 'Calories Burned', 'Intensity'])
+                for ex in exercises:
+                    writer.writerow(ex)
+            messagebox.showinfo("Export Successful", f"Data successfully exported to {filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"An error occurred while exporting the data: {e}")
+
+    def update_motivational_message(self):
+        yesterday = (datetime.datetime.strptime(self.current_date, "%Y-%m-%d") - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday_meals = self.db.get_meals_by_date(yesterday)
+        yesterday_calories = sum(meal[4] for meal in yesterday_meals)
+
+        today_calories = self.totals['calories']
+
+        message = ""
+        if yesterday_calories > 0:
+            if yesterday_calories >= self.target_calories:
+                message = f"Great job yesterday! You met your calorie goal. Keep up the good work today!"
+            else:
+                message = f"Yesterday you were under your calorie goal. Let's aim to hit {self.target_calories:,.0f} kcal today!"
+        else:
+            message = "Welcome! Let's start tracking for a healthier you."
+
+        if today_calories > self.target_calories:
+            message += "\n\nYou've exceeded your calorie goal for today. Be mindful of your intake."
+
+        self.motivational_label.configure(text=message)
+
+
+if __name__ == "__main__":
+    app = SmartCalorieTrackerApp()
+    app.mainloop()
